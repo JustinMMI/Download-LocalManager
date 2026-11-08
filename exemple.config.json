@@ -1,0 +1,12 @@
+{
+    "dossier_temp_brave": "C:\\Users\\TonNom\\Downloads\\Download_Temp",
+    "dossier_telechargements_classique": "C:\\Users\\TonNom\\Downloads",
+    "dossier_tampon_nas": "C:\\Users\\TonNom\\Downloads\\Download_Temp\\Buffer_NAS",
+    "destination_nas": "\\\\192.168.X.X\\TonPartage\\Destination",
+    "regles_routage": [
+        {
+            "url_source": ".*tonsite\\.com",
+            "dossier_destination": "C:\\Users\\TonNom\\Downloads\\Download_Temp\\Buffer_NAS"
+        }
+    ]
+}
