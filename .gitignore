@@ -402,3 +402,5 @@ FodyWeavers.xsd
 
 config.json
 *.txt
+*.txt
+last_path.txt
