@@ -1,93 +1,277 @@
 Add-Type -AssemblyName System.Windows.Forms
 $scriptDir = $PSScriptRoot
-$config = Get-Content (Join-Path $scriptDir "config.json") | ConvertFrom-Json
+$config = Get-Content (Join-Path $scriptDir "config.json") -Encoding UTF8 | ConvertFrom-Json
 $lastPathFile = Join-Path $scriptDir "last_path.txt"
+$logFile = Join-Path $scriptDir "Chromium_Master.log"
+$processedFile = Join-Path $scriptDir "processed_downloads.txt"
 
 $tempBrave = $config.dossier_temp_brave
 $mainDownloads = $config.dossier_telechargements_classique
+$processedFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+if (Test-Path -LiteralPath $processedFile) {
+    Get-Content -LiteralPath $processedFile -Encoding UTF8 |
+        Where-Object { $_ } |
+        ForEach-Object { [void]$processedFiles.Add($_) }
+}
 
 if (-not (Test-Path $tempBrave)) { New-Item -ItemType Directory -Path $tempBrave -Force | Out-Null }
 
+function Write-RouteLog {
+    param([string]$Message)
+    Add-Content -LiteralPath $logFile -Encoding UTF8 -Value "$(Get-Date -Format s) $Message"
+}
+
+function Mark-FileProcessed {
+    param([System.IO.FileInfo]$File)
+    $signature = "{0}|{1}|{2}|{3}" -f $File.FullName, $File.Length, $File.LastWriteTimeUtc.Ticks, $File.CreationTimeUtc.Ticks
+    if ($processedFiles.Add($signature)) {
+        Add-Content -LiteralPath $processedFile -Encoding UTF8 -Value $signature
+    }
+}
+
+function Test-FileProcessed {
+    param([System.IO.FileInfo]$File)
+    $signature = "{0}|{1}|{2}|{3}" -f $File.FullName, $File.Length, $File.LastWriteTimeUtc.Ticks, $File.CreationTimeUtc.Ticks
+    return $processedFiles.Contains($signature)
+}
+
+function Show-DownloadSaveDialog {
+    param([System.Windows.Forms.SaveFileDialog]$Dialog)
+
+    $owner = New-Object System.Windows.Forms.Form
+    $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $owner.ShowInTaskbar = $false
+    $owner.ShowIcon = $false
+    $owner.TopMost = $true
+    $owner.Opacity = 0
+    $owner.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $owner.Size = New-Object System.Drawing.Size(1, 1)
+    $owner.Location = New-Object System.Drawing.Point(
+        ([System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Right - 1),
+        ([System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea.Bottom - 1)
+    )
+    $owner.Show()
+    $owner.Activate()
+    $result = $Dialog.ShowDialog($owner)
+    $owner.Close()
+    $owner.Dispose()
+    return $result
+}
+
+function Test-FileReady {
+    param([System.IO.FileInfo]$File)
+    try {
+        $stream = [System.IO.File]::Open($File.FullName, 'Open', 'Read', 'None')
+        $stream.Dispose()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-DownloadOrigin {
+    param([System.IO.FileInfo]$File)
+    $zone = Get-Content -LiteralPath $File.FullName -Stream Zone.Identifier -Raw -ErrorAction Stop
+    return ($zone -replace "`0", "")
+}
+
+function Get-RoutingRule {
+    param([System.IO.FileInfo]$File)
+    $origin = Get-DownloadOrigin $File
+    foreach ($rule in $config.regles_routage) {
+        if (($origin -match "HostUrl=$($rule.url_source)") -or
+            ($origin -match "ReferrerUrl=$($rule.url_source)")) {
+            return $rule
+        }
+    }
+    return $null
+}
+
+function New-BraveLink {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath
+    )
+    $sourceDrive = (Split-Path $SourcePath -Qualifier).ToUpperInvariant()
+    $destinationDrive = (Split-Path $DestinationPath -Qualifier).ToUpperInvariant()
+    if ($sourceDrive -ne $destinationDrive) {
+        return $false
+    }
+
+    if (Test-Path -LiteralPath $DestinationPath) {
+        throw "La destination existe déjà: $DestinationPath"
+    }
+    $result = & cmd.exe /c "mklink /H `"$DestinationPath`" `"$SourcePath`"" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Création du lien impossible: $($result -join ' ')"
+    }
+    return $true
+}
+
+function Get-UniqueDestinationPath {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $Path
+    }
+
+    $directory = Split-Path -Parent $Path
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    $extension = [System.IO.Path]::GetExtension($Path)
+    $index = 1
+    do {
+        $candidate = Join-Path $directory "$baseName ($index)$extension"
+        $index++
+    } while (Test-Path -LiteralPath $candidate)
+    return $candidate
+}
+
+function New-BraveSymbolicLink {
+    param(
+        [string]$SourcePath,
+        [string]$DestinationPath
+    )
+    if (Test-Path -LiteralPath $SourcePath) {
+        Remove-Item -LiteralPath $SourcePath -Force -ErrorAction Stop
+    }
+    $result = & cmd.exe /c "mklink `"$SourcePath`" `"$DestinationPath`"" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Création du lien symbolique impossible: $($result -join ' ')"
+    }
+}
+
+function Test-RoutedFile {
+    param([System.IO.FileInfo]$File)
+    if ($File.LinkType -eq "SymbolicLink") {
+        return $true
+    }
+    return Test-FileProcessed $File
+}
+
+function New-PersistentBraveLink {
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$DestinationPath
+    )
+    $sourcePath = [System.IO.Path]::GetFullPath($File.FullName)
+    $destinationPath = [System.IO.Path]::GetFullPath($DestinationPath)
+    if ($sourcePath -eq $destinationPath) {
+        return
+    }
+
+    $sourceDrive = (Split-Path $sourcePath -Qualifier).ToUpperInvariant()
+    $destinationDrive = (Split-Path $destinationPath -Qualifier).ToUpperInvariant()
+    if ($sourceDrive -eq $destinationDrive) {
+        if (Test-Path -LiteralPath $destinationPath) {
+            Remove-Item -LiteralPath $destinationPath -Force -ErrorAction Stop
+        }
+        New-BraveLink -SourcePath $sourcePath -DestinationPath $destinationPath | Out-Null
+        return
+    }
+
+    if (Test-Path -LiteralPath $destinationPath) {
+        Remove-Item -LiteralPath $destinationPath -Force -ErrorAction Stop
+    }
+    Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force -ErrorAction Stop
+    try {
+        New-BraveSymbolicLink -SourcePath $sourcePath -DestinationPath $destinationPath
+    }
+    catch {
+        Copy-Item -LiteralPath $destinationPath -Destination $sourcePath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Move-RoutedFile {
+    param(
+        [System.IO.FileInfo]$File,
+        [string]$DestinationFolder
+    )
+    if (-not (Test-Path -LiteralPath $DestinationFolder)) {
+        New-Item -ItemType Directory -LiteralPath $DestinationFolder -Force -ErrorAction Stop | Out-Null
+    }
+
+    $destinationPath = Get-UniqueDestinationPath (Join-Path $DestinationFolder $File.Name)
+    if (New-BraveLink -SourcePath $File.FullName -DestinationPath $destinationPath) {
+        return $destinationPath
+    }
+
+    Move-Item -LiteralPath $File.FullName -Destination $destinationPath -Force -ErrorAction Stop
+    return $destinationPath
+}
+
 while ($true) {
-    # 1. Nettoyage des fantômes (liens physiques) de plus de 12 heures
-    $oldFiles = Get-ChildItem -Path $tempBrave -File | Where-Object { $_.CreationTime -lt (Get-Date).AddHours(-12) }
+    $oldFiles = Get-ChildItem -LiteralPath $tempBrave -File |
+        Where-Object { $_.CreationTime -lt (Get-Date).AddHours(-12) }
     foreach ($old in $oldFiles) {
-        # On supprime uniquement si c'est un de nos fantômes marqués
-        if (Get-Item -Path $old.FullName -Stream "BraveRouted" -ErrorAction SilentlyContinue) {
-            Remove-Item -Path $old.FullName -Force -ErrorAction SilentlyContinue
+        if (Get-Item -LiteralPath $old.FullName -Stream BraveRouted -ErrorAction SilentlyContinue) {
+            Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
         }
     }
 
-    # 2. Scan des nouveaux téléchargements
-    $files = Get-ChildItem -Path $tempBrave -File | Where-Object { $_.Extension -notmatch "\.crdownload$|\.tmp$" }
-    
-    foreach ($file in $files) {
-        # Ignorer la boucle si c'est un fantôme qu'on a déjà traité
-        if (Get-Item -Path $file.FullName -Stream "BraveRouted" -ErrorAction SilentlyContinue) {
-            continue
+    $files = Get-ChildItem -LiteralPath $tempBrave -File |
+        Where-Object {
+            $_.Extension -notmatch "\.crdownload$|\.tmp$" -and
+            -not (Test-RoutedFile $_)
         }
 
-        Start-Sleep -Milliseconds 400
-        $estRoute = $false
-        $finalPath = ""
-        
+    $routedFiles = foreach ($file in $files) {
+        if (-not (Test-FileReady $file)) { continue }
         try {
-            $zone = Get-Content -Path $file.FullName -Stream Zone.Identifier -ErrorAction Stop
-            
-            foreach ($regle in $config.regles_routage) {
-                if (($zone -match "HostUrl=$($regle.url_source)") -or ($zone -match "ReferrerUrl=$($regle.url_source)")) {
-                    $destFolder = $regle.dossier_destination
-                    if (-not (Test-Path $destFolder)) { New-Item -ItemType Directory -Path $destFolder -Force | Out-Null }
-                    
-                    $finalPath = Join-Path $destFolder $file.Name
-                    Move-Item -Path $file.FullName -Destination $finalPath -Force
-                    $estRoute = $true
-                    break
-                }
+            $rule = Get-RoutingRule $file
+            if ($null -ne $rule) {
+                $finalPath = Move-RoutedFile -File $file -DestinationFolder $rule.dossier_destination
+                Mark-FileProcessed -File $file
+                Write-RouteLog "Routé: $($file.Name) -> $finalPath"
+                [PSCustomObject]@{ File = $file; FinalPath = $finalPath }
             }
         }
-        catch { }
+        catch {
+            Write-RouteLog "Échec du routage de $($file.Name): $($_.Exception.Message)"
+        }
+    }
 
-        # Pas de règle -> Fenêtre native Windows
-        if (-not $estRoute) {
+    foreach ($item in $routedFiles) {
+        $files = $files | Where-Object { $_.FullName -ne $item.File.FullName }
+    }
+
+    foreach ($file in $files) {
+        if (-not (Test-FileReady $file)) { continue }
+        try {
             $dialog = New-Object System.Windows.Forms.SaveFileDialog
             $dialog.FileName = $file.Name
             $dialog.Title = "Enregistrer sous"
             $dialog.Filter = "Tous les fichiers (*.*)|*.*"
             
-            if (Test-Path $lastPathFile) { $dialog.InitialDirectory = Get-Content $lastPathFile } 
+            if (Test-Path -LiteralPath $lastPathFile) { $dialog.InitialDirectory = Get-Content -LiteralPath $lastPathFile }
             else { $dialog.InitialDirectory = $mainDownloads }
             
-            $form = New-Object System.Windows.Forms.Form
-            $form.TopMost = $true
-            $result = $dialog.ShowDialog($form)
+            Write-RouteLog "Ouverture de la fenêtre pour $($file.Name)"
+            $result = Show-DownloadSaveDialog -Dialog $dialog
+            Write-RouteLog "Résultat de la fenêtre pour $($file.Name): $result"
             
             if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
                 $finalPath = $dialog.FileName
-                Move-Item -Path $file.FullName -Destination $finalPath -Force
-                Set-Content -Path $lastPathFile -Value (Split-Path $finalPath)
+                if (-not (Test-Path -LiteralPath $file.FullName)) {
+                    throw "Le fichier n'est plus présent dans le sas."
+                }
+                New-PersistentBraveLink -File $file -DestinationPath $finalPath
+                Mark-FileProcessed -File $file
+                Set-Content -LiteralPath $lastPathFile -Value (Split-Path $finalPath) -ErrorAction Stop
             }
             else {
-                # Si annulé, ça part dans Téléchargements normal
                 $finalPath = Join-Path $mainDownloads $file.Name
-                Move-Item -Path $file.FullName -Destination $finalPath -Force
+                if (-not (Test-Path -LiteralPath $file.FullName)) {
+                    throw "Le fichier n'est plus présent dans le sas."
+                }
+                New-PersistentBraveLink -File $file -DestinationPath $finalPath
+                Mark-FileProcessed -File $file
             }
-            $form.Dispose()
             $dialog.Dispose()
+            Write-RouteLog "Déplacement manuel: $($file.Name) -> $finalPath"
         }
-        
-        # 3. La magie : Création du fantôme pour Brave
-        if (Test-Path $finalPath) {
-            $driveSource = Split-Path $tempBrave -Qualifier
-            $driveDest = Split-Path $finalPath -Qualifier
-            
-            # Les Hardlinks ne fonctionnent que si la source et la cible sont sur le même disque (ex: C:)
-            if ($driveSource -eq $driveDest) {
-                cmd /c mklink /H "`"$($file.FullName)`"" "`"$finalPath`"" | Out-Null
-                
-                # On marque le fichier avec un flux caché pour que la boucle l'ignore
-                Set-Content -Path $file.FullName -Stream "BraveRouted" -Value "1" -ErrorAction SilentlyContinue
-            }
+        catch {
+            Write-RouteLog "Échec du déplacement de $($file.Name): $($_.Exception.Message)"
         }
     }
     Start-Sleep -Seconds 2
