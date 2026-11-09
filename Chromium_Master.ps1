@@ -21,19 +21,49 @@ function Write-RouteLog {
     Add-Content -LiteralPath $logFile -Encoding UTF8 -Value "$(Get-Date -Format s) $Message"
 }
 
+function Compact-ProcessedState {
+    $latestByPath = @{}
+    foreach ($entry in $processedFiles) {
+        $separator = $entry.IndexOf("|")
+        $path = if ($separator -lt 1) { $entry } else { $entry.Substring(0, $separator) }
+        if (Test-Path -LiteralPath $path) {
+            $current = Get-Item -LiteralPath $path -Force
+            $latestByPath[$path] = "{0}|{1}" -f $path, $current.CreationTimeUtc.Ticks
+        }
+    }
+
+    $processedFiles.Clear()
+    foreach ($entry in $latestByPath.Values) {
+        [void]$processedFiles.Add($entry)
+    }
+    Set-Content -LiteralPath $processedFile -Encoding UTF8 -Value @($latestByPath.Values)
+}
+
 function Mark-FileProcessed {
     param([System.IO.FileInfo]$File)
-    $signature = "{0}|{1}|{2}|{3}" -f $File.FullName, $File.Length, $File.LastWriteTimeUtc.Ticks, $File.CreationTimeUtc.Ticks
-    if ($processedFiles.Add($signature)) {
-        Add-Content -LiteralPath $processedFile -Encoding UTF8 -Value $signature
+    $current = Get-Item -LiteralPath $File.FullName -Force
+    $entry = "{0}|{1}" -f $current.FullName, $current.CreationTimeUtc.Ticks
+    if ($processedFiles.Add($entry)) {
+        Add-Content -LiteralPath $processedFile -Encoding UTF8 -Value $entry
+        Compact-ProcessedState
+    }
+}
+
+function Remove-FileProcessed {
+    param([System.IO.FileInfo]$File)
+    $entry = "{0}|{1}" -f $File.FullName, $File.CreationTimeUtc.Ticks
+    if ($processedFiles.Remove($entry)) {
+        Set-Content -LiteralPath $processedFile -Encoding UTF8 -Value @($processedFiles)
     }
 }
 
 function Test-FileProcessed {
     param([System.IO.FileInfo]$File)
-    $signature = "{0}|{1}|{2}|{3}" -f $File.FullName, $File.Length, $File.LastWriteTimeUtc.Ticks, $File.CreationTimeUtc.Ticks
-    return $processedFiles.Contains($signature)
+    $prefix = "{0}|" -f $File.FullName
+    return @($processedFiles | Where-Object { $_ -like "$prefix*" }).Count -gt 0
 }
+
+Compact-ProcessedState
 
 function Show-DownloadSaveDialog {
     param([System.Windows.Forms.SaveFileDialog]$Dialog)
@@ -204,8 +234,11 @@ while ($true) {
     $oldFiles = Get-ChildItem -LiteralPath $tempBrave -File |
         Where-Object { $_.CreationTime -lt (Get-Date).AddHours(-12) }
     foreach ($old in $oldFiles) {
-        if (Get-Item -LiteralPath $old.FullName -Stream BraveRouted -ErrorAction SilentlyContinue) {
+        if (Test-FileProcessed $old) {
             Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue
+            if (-not (Test-Path -LiteralPath $old.FullName)) {
+                Remove-FileProcessed -File $old
+            }
         }
     }
 
